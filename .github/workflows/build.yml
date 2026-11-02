@@ -1,0 +1,45 @@
+name: Build Installer
+
+on:
+  workflow_dispatch: # Permet de lancer le build d'un simple clic
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Apply Patch
+        run: |
+          if (Test-Path "patch.diff") {
+            git apply --verbose patch.diff
+            Write-Host "Patch appliqué avec succès."
+          } else {
+            Write-Host "Aucun patch trouvé, compilation standard."
+          }
+        shell: powershell
+
+      - name: Build Project
+        run: |
+          npm install
+          npx tauri build --config app/tauri.conf.json
+        env:
+          CI: true
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: WestPlay-Modifie
+          path: |
+            **/target/release/bundle/nsis/*.exe
+            **/target/release/*.exe
