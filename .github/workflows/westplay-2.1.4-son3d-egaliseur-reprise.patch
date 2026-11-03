@@ -1,0 +1,1263 @@
+diff --git a/crates/host/src/apple_music.rs b/crates/host/src/apple_music.rs
+index fe6290f..67ad0ed 100644
+--- a/crates/host/src/apple_music.rs
++++ b/crates/host/src/apple_music.rs
+@@ -109,7 +109,7 @@ enum Cab {
+         on: bool,
+         distance: f32,
+     },
+-    /// The player's tone (the cab's Settings › Sound): bass, mid and treble, dB each.
++    /// The player's tone (the cab's Settings › Sound): ten bands, dB each.
+     Equalizer {
+         #[serde(flatten)]
+         equalizer: Equalizer,
+diff --git a/crates/host/src/cab_sound.js b/crates/host/src/cab_sound.js
+index 87d6d2e..6c6580b 100644
+--- a/crates/host/src/cab_sound.js
++++ b/crates/host/src/cab_sound.js
+@@ -53,24 +53,69 @@ window.westplayCabSound = (media, say) => {
+       else param.setTargetAtTime(value, currentTime, 0.05)
+     }
+   }
+-  // The player's tone (the cab's Settings › Sound), as a car stereo's: bass, mid and treble, dB each, on all
+-  // the sound before it's split to the speakers. Each band a filter (the bass a shelf under 100 Hz, the mids a
+-  // broad bell round 1 kHz, the treble a shelf over 8 kHz); the whole turned down by the most any band lifts, so
+-  // a boost shapes the sound without pushing it past full. Set as it's changed, gliding (no click).
+-  let equalizer = { bass: 0, mid: 0, treble: 0 }
+-  const TONE = [
+-    ['bass', { type: 'lowshelf', frequency: 100 }],
+-    ['mid', { type: 'peaking', frequency: 1000, Q: 0.7 }],
+-    ['treble', { type: 'highshelf', frequency: 8000 }],
+-  ]
+-  const flat = () => TONE.every(([band]) => !equalizer[band])
++  // The player's tone (the cab's Settings › Sound), a graphic equalizer's: ten bands an octave apart (the host's
++  // `Equalizer::FREQUENCIES`), dB each, on all the sound before it's split to the speakers. Each band a filter
++  // (the lowest a shelf under 32 Hz, the highest a shelf over 16 kHz, the others bells an octave wide); the whole
++  // turned down by the most the bands together lift any frequency (adjacent bands lifted add up, so it's their
++  // sum that's found, not the highest one), so a boost shapes the sound without pushing it past full. Set as
++  // it's changed, gliding (no click).
++  const BELL_Q = Math.SQRT2
++  const TONE = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000].map((frequency, i, all) => [
++    String(frequency),
++    i === 0
++      ? { type: 'lowshelf', frequency }
++      : i === all.length - 1
++        ? { type: 'highshelf', frequency }
++        : { type: 'peaking', frequency, Q: BELL_Q },
++  ])
++  const MOST_DB = 12
++  let equalizer = TONE.map(() => 0)
++  const flat = () => equalizer.every((db) => !db)
++  // How much a band (`options`, set to `gain` dB) lifts `hz` at the sample rate `rate`, dB: the filter's own
++  // formulas (Web Audio's, the shelves' slope 1), found for the lift the bands add up to.
++  const responseDb = ({ type, frequency, Q }, gain, hz, rate) => {
++    const A = 10 ** (gain / 40)
++    const w0 = (2 * Math.PI * frequency) / rate
++    const [sin, cos] = [Math.sin(w0), Math.cos(w0)]
++    let b
++    let a
++    if (type === 'peaking') {
++      const alpha = sin / (2 * Q)
++      b = [1 + alpha * A, -2 * cos, 1 - alpha * A]
++      a = [1 + alpha / A, -2 * cos, 1 - alpha / A]
++    } else {
++      const k = 2 * Math.sqrt(A) * (sin / Math.SQRT2)
++      if (type === 'lowshelf') {
++        b = [A * (A + 1 - (A - 1) * cos + k), 2 * A * (A - 1 - (A + 1) * cos), A * (A + 1 - (A - 1) * cos - k)]
++        a = [A + 1 + (A - 1) * cos + k, -2 * (A - 1 + (A + 1) * cos), A + 1 + (A - 1) * cos - k]
++      } else {
++        b = [A * (A + 1 + (A - 1) * cos + k), -2 * A * (A - 1 + (A + 1) * cos), A * (A + 1 + (A - 1) * cos - k)]
++        a = [A + 1 - (A - 1) * cos + k, 2 * (A - 1 - (A + 1) * cos), A + 1 - (A - 1) * cos - k]
++      }
++    }
++    const w = (2 * Math.PI * hz) / rate
++    const size = (c) => Math.hypot(c[0] + c[1] * Math.cos(w) + c[2] * Math.cos(2 * w), -c[1] * Math.sin(w) - c[2] * Math.sin(2 * w))
++    return 20 * Math.log10(size(b) / size(a))
++  }
++  // The most the bands together lift any frequency from 20 Hz to 20 kHz, dB (0 if they only cut).
++  const liftOf = (gains, rate) => {
++    let most = 0
++    for (let k = 0; k < 120; k++) {
++      const hz = 20 * 1000 ** (k / 119)
++      let db = 0
++      TONE.forEach(([, options], i) => {
++        if (gains[i]) db += responseDb(options, gains[i], hz, rate)
++      })
++      most = Math.max(most, db)
++    }
++    return most
++  }
+   const setTone = (atOnce) => {
+     if (!audio?.tone) return
+-    const { currentTime } = audio.context
++    const { currentTime, sampleRate } = audio.context
+     const set = (param, value) => (atOnce ? param.setValueAtTime(value, currentTime) : param.setTargetAtTime(value, currentTime, 0.05))
+-    TONE.forEach(([band], i) => set(audio.tone.bands[i].gain, equalizer[band]))
+-    const lift = Math.max(0, ...TONE.map(([band]) => equalizer[band]))
+-    set(audio.tone.trim.gain, 10 ** (-lift / 20))
++    equalizer.forEach((db, i) => set(audio.tone.bands[i].gain, db))
++    set(audio.tone.trim.gain, 10 ** (-liftOf(equalizer, sampleRate) / 20))
+   }
+   // The music's spectrum, while the cab's Equalizer asks for it (`spectrum(true)`): BARS bars from LOWEST to
+   // HIGHEST Hz, spaced by octaves (as the ear hears them), each its loudest bin's loudness (0 to 255), measured
+@@ -304,7 +349,8 @@ window.westplayCabSound = (media, say) => {
+       } catch {}
+     },
+     equalizer(told) {
+-      equalizer = Object.fromEntries(TONE.map(([band]) => [band, Number(told?.[band]) || 0]))
++      // Each band within its range (the host keeps them there too); one that isn't a number is flat.
++      equalizer = TONE.map((_, i) => Math.max(-MOST_DB, Math.min(MOST_DB, Number(told?.bands?.[i]) || 0)))
+       setTone(false)
+       try {
+         wire()
+diff --git a/crates/host/src/lib.rs b/crates/host/src/lib.rs
+index 81a7af7..aaa6415 100644
+--- a/crates/host/src/lib.rs
++++ b/crates/host/src/lib.rs
+@@ -305,6 +305,8 @@ pub fn run(mut config: Config, stop: Arc<AtomicBool>) -> Result<(), Error> {
+     let mut was_outside = false;
+     // The players' tone (the cab's Settings › Equalizer), passed on with the cab ([`settings::SoundSettings`]).
+     let mut equalizer = config.settings.get().sound.playing();
++    // Whether the sound comes from the truck's own speakers in 3D (Settings › Spatial Sound), or is the page's own.
++    let mut spatial = config.settings.get().sound.spatial;
+     // The music's spectrum wanted by the cab (its Equalizer open): asked of the players with the cab.
+     let mut spectrum = false;
+     // The page's height (`westplay_shared::page_height`): the frame's until a screen asks for another.
+@@ -809,15 +811,24 @@ pub fn run(mut config: Config, stop: Arc<AtomicBool>) -> Result<(), Error> {
+                 Some(PageMessage::Spectrum { on }) => spectrum = on,
+                 Some(PageMessage::CursorLight { light }) => cursor.set_light(light, Instant::now()),
+                 Some(PageMessage::Equalizer { equalizer: curve, custom }) => {
+-                    let sound = settings::SoundSettings { equalizer: curve.clamped(), custom };
+-                    equalizer = sound.playing();
+                     let mut settings = config.settings.get();
++                    let sound = settings::SoundSettings { equalizer: curve.clamped(), custom, ..settings.sound };
++                    equalizer = sound.playing();
+                     if settings.sound != sound {
+                         settings.sound = sound;
+                         config.settings.set(settings.clone());
+                         (config.on_settings)(&settings);
+                     }
+                 }
++                Some(PageMessage::Spatial { on }) => {
++                    spatial = on;
++                    let mut settings = config.settings.get();
++                    if settings.sound.spatial != on {
++                        settings.sound.spatial = on;
++                        config.settings.set(settings.clone());
++                        (config.on_settings)(&settings);
++                    }
++                }
+                 Some(PageMessage::Wallpaper { id }) => {
+                     let mut settings = config.settings.get();
+                     if settings.look.wallpaper.as_deref() != Some(id.as_str()) && id.len() <= 300 {
+@@ -1426,7 +1437,10 @@ pub fn run(mut config: Config, stop: Arc<AtomicBool>) -> Result<(), Error> {
+             let head = speakers::Head::of(telemetry).turned(turn);
+             // The truck's speakers: its parts' for a truck whose speakers come with them (none until they're
+             // found), else its own.
++            // With Spatial Sound off (Settings › Sound) none: the page's own stereo plays, the tone and the cab's
++            // walls kept.
+             let truck_speakers = match &part_speakers {
++                _ if !spatial => None,
+                 Some(found) if found.truck == *truck => found.speakers.as_deref(),
+                 _ if speakers::by_parts(truck.id.as_str()) => None,
+                 _ => speakers::in_truck(truck.id.as_str()),
+@@ -1969,6 +1983,7 @@ fn settings_message(settings: &settings::Settings) -> String {
+         "iconStyle": settings.look.icon_style,
+         "equalizer": settings.sound.equalizer.clamped(),
+         "equalizerCustom": settings.sound.custom,
++        "spatial": settings.sound.spatial,
+     })
+     .to_string()
+ }
+@@ -1995,14 +2010,17 @@ enum PageMessage {
+     Wallpaper { id: String },
+     /// The truck's information bar beside WestPlay, kept or not, chosen in the cab's Settings (Appearance).
+     TruckStrip { strip: settings::TruckStrip },
+-    /// The players' tone, set in the cab's Settings (Equalizer): the player's curve (bass, mid and treble, dB
+-    /// each), and whether it plays (Custom) or the speakers as tuned (Recommended).
++    /// The players' tone, set in the cab's Settings (Equalizer): the player's curve (ten bands, dB each), and
++    /// whether it plays (Custom) or the speakers as tuned (Recommended).
+     Equalizer {
+         #[serde(flatten)]
+         equalizer: speakers::Equalizer,
+         #[serde(default)]
+         custom: bool,
+     },
++    /// Spatial Sound, set in the cab's Settings (Sound): the music from the truck's own speakers in 3D, or the
++    /// page's own stereo.
++    Spatial { on: bool },
+     /// The music's spectrum wanted (the cab's Equalizer open) or not: the players measure it, and it's passed
+     /// on to the page as they say it.
+     Spectrum { on: bool },
+@@ -2273,21 +2291,25 @@ mod tests {
+         );
+         assert_eq!(parse_page_message(r#"{"type":"truckStrip","strip":"sideways"}"#), None);
+         assert_eq!(
+-            parse_page_message(r#"{"type":"equalizer","bass":-3,"mid":0,"treble":2,"custom":true}"#),
++            parse_page_message(r#"{"type":"equalizer","bands":[-3,0,2,0,0,0,0,0,1.5,-12],"custom":true}"#),
+             Some(PageMessage::Equalizer {
+-                equalizer: crate::speakers::Equalizer { bass: -3, mid: 0, treble: 2 },
++                equalizer: crate::speakers::Equalizer { bands: [-3.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, -12.0] },
+                 custom: true
+             })
+         );
+-        // A band not said is flat; one past a byte is no message (one past the range is kept to it as it's set).
++        // A band not said is flat (2.1.4's bass, mid and treble still read as the bands they stood for); one that
++        // isn't a number is no message (one past the range is kept to it as it's set).
+         assert_eq!(
+             parse_page_message(r#"{"type":"equalizer","bass":4}"#),
+             Some(PageMessage::Equalizer {
+-                equalizer: crate::speakers::Equalizer { bass: 4, mid: 0, treble: 0 },
++                equalizer: crate::speakers::Equalizer { bands: [4.0, 4.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] },
+                 custom: false
+             })
+         );
+         assert_eq!(parse_page_message(r#"{"type":"equalizer","bass":400}"#), None);
++        assert_eq!(parse_page_message(r#"{"type":"equalizer","bands":"loud"}"#), None);
++        assert_eq!(parse_page_message(r#"{"type":"spatial","on":false}"#), Some(PageMessage::Spatial { on: false }));
++        assert_eq!(parse_page_message(r#"{"type":"spatial"}"#), None);
+         assert_eq!(parse_page_message(r#"{"type":"spectrum","on":true}"#), Some(PageMessage::Spectrum { on: true }));
+         assert_eq!(
+             parse_page_message(r#"{"type":"cursorLight","light":true}"#),
+@@ -2434,12 +2456,15 @@ mod tests {
+                 "wallpaper": null,
+                 "iconSet": null,
+                 "iconStyle": "auto",
+-                "equalizer": { "bass": 0, "mid": 0, "treble": 0 },
++                "equalizer": { "bands": vec![0.0; crate::speakers::EQUALIZER_BANDS] },
+                 "equalizerCustom": false,
++                "spatial": true,
+             })
+         );
+         settings.screen.truck_strip = crate::settings::TruckStrip::Off;
+-        settings.sound.equalizer = crate::speakers::Equalizer { bass: -9, mid: 2, treble: 6 };
++        settings.sound.equalizer =
++            crate::speakers::Equalizer { bands: [-20.0, -9.0, 2.0, 0.25, 0.0, 6.0, 12.0, 13.0, -0.2, 7.5] };
++        settings.sound.spatial = false;
+         settings.look.wallpaper = Some("custom:Dusk".into());
+         settings.look.icon_set = Some("Retro".into());
+         let message: serde_json::Value = serde_json::from_str(&settings_message(&settings)).unwrap();
+@@ -2447,11 +2472,18 @@ mod tests {
+         assert_eq!(message["wallpaper"], "custom:Dusk");
+         assert_eq!(message["iconSet"], "Retro");
+         // Within the range, whatever the file says.
+-        assert_eq!(message["equalizer"], serde_json::json!({ "bass": -6, "mid": 2, "treble": 6 }));
++        assert_eq!(
++            message["equalizer"],
++            serde_json::json!({ "bands": [-12.0, -9.0, 2.0, 0.5, 0.0, 6.0, 12.0, 12.0, 0.0, 7.5] })
++        );
++        assert_eq!(message["spatial"], false);
+         // The curve is kept whichever is chosen; what plays is it, with Custom only.
+         assert_eq!(settings.sound.playing(), crate::speakers::Equalizer::default());
+         settings.sound.custom = true;
+-        assert_eq!(settings.sound.playing(), crate::speakers::Equalizer { bass: -6, mid: 2, treble: 6 });
++        assert_eq!(
++            settings.sound.playing(),
++            crate::speakers::Equalizer { bands: [-12.0, -9.0, 2.0, 0.5, 0.0, 6.0, 12.0, 12.0, 0.0, 7.5] }
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/host/src/settings.rs b/crates/host/src/settings.rs
+index cec6b16..d8eefa0 100644
+--- a/crates/host/src/settings.rs
++++ b/crates/host/src/settings.rs
+@@ -35,10 +35,11 @@ pub struct Settings {
+     pub sound: SoundSettings,
+ }
+ 
+-/// The sound the players play: its tone (the cab's Settings › Equalizer), the same in every truck. As iOS's
+-/// AirPods have it (owner 2026-10-22): Recommended, the speakers as tuned, or Custom, the player's own curve
+-/// (kept while Recommended plays).
+-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
++/// The sound the players play: its tone (the cab's Settings › Equalizer), the same in every truck, and whether it
++/// comes from the truck's own speakers in 3D (Settings › Spatial Sound). As iOS's AirPods have it (owner
++/// 2026-10-22): Recommended, the speakers as tuned, or Custom, the player's own curve (kept while Recommended
++/// plays).
++#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+ #[serde(rename_all = "camelCase", default)]
+ pub struct SoundSettings {
+     /// The player's own curve.
+@@ -47,6 +48,17 @@ pub struct SoundSettings {
+     /// Custom chosen: the curve plays (otherwise flat).
+     #[serde(deserialize_with = "lenient")]
+     pub custom: bool,
++    /// The sound comes from the truck's own speakers, placed in the cab and heard from the driver's head (3D);
++    /// off, it's the page's own stereo, the tone and the cab's walls kept. On, as it always was before this was
++    /// a setting.
++    #[serde(deserialize_with = "lenient_on")]
++    pub spatial: bool,
++}
++
++impl Default for SoundSettings {
++    fn default() -> Self {
++        Self { equalizer: crate::speakers::Equalizer::default(), custom: false, spatial: true }
++    }
+ }
+ 
+ impl SoundSettings {
+@@ -317,6 +329,12 @@ fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(deserialize
+     Ok(T::deserialize(value).unwrap_or_default())
+ }
+ 
++/// Like [`lenient`], for a switch that is on unless the file says it's off: a value that isn't a switch leaves it on.
++fn lenient_on<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
++    let value = serde_json::Value::deserialize(deserializer)?;
++    Ok(bool::deserialize(value).unwrap_or(true))
++}
++
+ /// The file's content: the version, then the settings.
+ #[derive(Serialize)]
+ struct FileContent<'a> {
+@@ -448,8 +466,9 @@ mod tests {
+             },
+             graphics: GraphicsSettings { gpu: Some("10de:2702:00000000:161".into()) },
+             sound: SoundSettings {
+-                equalizer: crate::speakers::Equalizer { bass: -3, mid: 1, treble: 2 },
++                equalizer: crate::speakers::Equalizer { bands: [-3.0, -3.0, -1.5, 0.0, 1.0, 0.5, 2.0, 2.5, 0.0, 4.5] },
+                 custom: true,
++                spatial: false,
+             },
+         };
+         let json = to_json(&settings);
+@@ -512,6 +531,17 @@ mod tests {
+         assert_eq!(parse(r#"{"version": 2, "keybinds": 4}"#).unwrap().keybinds, defaults);
+     }
+ 
++    #[test]
++    fn sound_settings_from_2_1_4_keep_their_tone_and_the_3d_sound_stays_on() {
++        let old = parse(r#"{"version":2,"sound":{"equalizer":{"bass":-4,"mid":2,"treble":3},"custom":true}}"#).unwrap();
++        assert!(old.sound.custom && old.sound.spatial);
++        assert_eq!(old.sound.equalizer.bands, [-4.0, -4.0, -4.0, 0.0, 2.0, 2.0, 2.0, 0.0, 3.0, 3.0]);
++        assert!(parse(r#"{"version":2}"#).unwrap().sound.spatial);
++        // Turned off it stays off, and a value that isn't a switch leaves it on.
++        assert!(!parse(r#"{"version":2,"sound":{"spatial":false}}"#).unwrap().sound.spatial);
++        assert!(parse(r#"{"version":2,"sound":{"spatial":"no"}}"#).unwrap().sound.spatial);
++    }
++
+     #[test]
+     fn the_first_versions_keys_by_name_become_their_codes() {
+         for (name, code) in [("leftAlt", 0xa4), ("rightCtrl", 0xa3), ("mouseBack", 0x05), ("mouseForward", 0x06)] {
+diff --git a/crates/host/src/speakers.rs b/crates/host/src/speakers.rs
+index c0a29cf..47f961d 100644
+--- a/crates/host/src/speakers.rs
++++ b/crates/host/src/speakers.rs
+@@ -1074,25 +1074,76 @@ impl Head {
+     }
+ }
+ 
+-/// The player's tone controls, as a car stereo's (the cab's Settings › Sound): how much of the bass, the mids and
+-/// the treble, in dB each, [`Equalizer::MOST`] either way. One for every truck (owner 2026-10-22), on all the
+-/// sound the players play, before it's split to the speakers (a truck whose speakers aren't known too).
+-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+-#[serde(default)]
++/// How many bands the equalizer has (see [`Equalizer::FREQUENCIES`]).
++pub const EQUALIZER_BANDS: usize = 10;
++
++/// The player's tone controls, a graphic equalizer's (the cab's Settings › Sound): ten bands an octave apart
++/// ([`Equalizer::FREQUENCIES`], the first a low shelf and the last a high shelf), each in dB,
++/// [`Equalizer::MOST`] either way in steps of [`Equalizer::STEP`]. One for every truck (owner 2026-10-22), on
++/// all the sound the players play, before it's split to the speakers (a truck whose speakers aren't known too).
++///
++/// It was bass, mid and treble (±6 dB, whole steps) up to WestPlay 2.1.4: those are still read, from settings
++/// kept then and from a page that still says them, as the bands they stood for.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
++#[serde(from = "Told")]
+ pub struct Equalizer {
+-    pub bass: i8,
+-    pub mid: i8,
+-    pub treble: i8,
++    pub bands: [f32; EQUALIZER_BANDS],
+ }
+ 
+-impl Equalizer {
+-    /// How far each band goes, dB (owner 2026-10-22: a car stereo's tone range).
+-    pub const MOST: i8 = 6;
++/// What an equalizer is told as: its bands, or bass, mid and treble as 2.1.4 had them.
++#[derive(Deserialize)]
++#[serde(default)]
++struct Told {
++    bands: Option<Vec<f32>>,
++    bass: i8,
++    mid: i8,
++    treble: i8,
++}
+ 
+-    /// Each band within [`Equalizer::MOST`] either way.
++impl Default for Told {
++    fn default() -> Self {
++        Self { bands: None, bass: 0, mid: 0, treble: 0 }
++    }
++}
++
++impl From<Told> for Equalizer {
++    fn from(told: Told) -> Self {
++        let mut bands = [0.0; EQUALIZER_BANDS];
++        if let Some(told) = told.bands {
++            // Missing bands flat, extra ones left out.
++            for (band, db) in bands.iter_mut().zip(told) {
++                *band = db;
++            }
++        } else {
++            // Bass over the lowest three bands (32 to 125 Hz), mid over the middle three (500 Hz to 2 kHz), treble
++            // over the highest two (8 and 16 kHz).
++            for (range, db) in [(0..3, told.bass), (4..7, told.mid), (8..10, told.treble)] {
++                bands[range].fill(f32::from(db));
++            }
++        }
++        Self { bands }
++    }
++}
++
++impl Equalizer {
++    /// Where each band is centred, Hz.
++    pub const FREQUENCIES: [u32; EQUALIZER_BANDS] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
++    /// How far each band goes, dB.
++    pub const MOST: f32 = 12.0;
++    /// The steps a band is set in, dB.
++    pub const STEP: f32 = 0.5;
++
++    /// Each band within [`Equalizer::MOST`] either way, on its nearest step (one that isn't a number, flat).
+     pub fn clamped(self) -> Self {
+-        let clamp = |db: i8| db.clamp(-Self::MOST, Self::MOST);
+-        Self { bass: clamp(self.bass), mid: clamp(self.mid), treble: clamp(self.treble) }
++        let clamp = |db: f32| {
++            // `+ 0.0`: a band rounded to -0 is 0.
++            if db.is_finite() {
++                ((db / Self::STEP).round() * Self::STEP).clamp(-Self::MOST, Self::MOST) + 0.0
++            } else {
++                0.0
++            }
++        };
++        Self { bands: self.bands.map(clamp) }
+     }
+ }
+ 
+@@ -1239,10 +1290,32 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn keeps_the_tone_within_a_car_stereos_range() {
+-        let wild = Equalizer { bass: -40, mid: 3, treble: 100 };
+-        assert_eq!(wild.clamped(), Equalizer { bass: -6, mid: 3, treble: 6 });
++    fn keeps_the_tone_within_its_range_and_steps() {
++        let wild = Equalizer { bands: [-40.0, 3.0, 100.0, 4.26, -0.2, 0.24, 11.9, -12.0, f32::NAN, f32::INFINITY] };
++        assert_eq!(wild.clamped(), Equalizer { bands: [-12.0, 3.0, 12.0, 4.5, 0.0, 0.0, 12.0, -12.0, 0.0, 0.0] });
+         assert_eq!(Equalizer::default().clamped(), Equalizer::default());
++        // A band that rounds to nothing is a plain zero (not -0), as the page and the settings file say it.
++        assert!(Equalizer { bands: [-0.2; EQUALIZER_BANDS] }.clamped().bands.iter().all(|db| db.is_sign_positive()));
++    }
++
++    #[test]
++    fn reads_bands_or_bass_mid_and_treble_as_2_1_4_had_them() {
++        let bands: Equalizer = serde_json::from_str(r#"{"bands":[1,2,3,4,5,6,7,8,9,-10.5]}"#).unwrap();
++        assert_eq!(bands.bands, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, -10.5]);
++        // Short: the rest flat. Long: the rest left out.
++        let short: Equalizer = serde_json::from_str(r#"{"bands":[2,-2]}"#).unwrap();
++        assert_eq!(short.bands, [2.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
++        let long: Equalizer = serde_json::from_str(r#"{"bands":[1,1,1,1,1,1,1,1,1,1,9,9]}"#).unwrap();
++        assert_eq!(long.bands, [1.0; EQUALIZER_BANDS]);
++        // 2.1.4's: the bass over the lowest three bands, the mids over the middle three, the treble over the top two.
++        let old: Equalizer = serde_json::from_str(r#"{"bass":-3,"mid":1,"treble":2}"#).unwrap();
++        assert_eq!(old.bands, [-3.0, -3.0, -3.0, 0.0, 1.0, 1.0, 1.0, 0.0, 2.0, 2.0]);
++        assert_eq!(serde_json::from_str::<Equalizer>("{}").unwrap(), Equalizer::default());
++        assert!(serde_json::from_str::<Equalizer>(r#"{"bass":400}"#).is_err());
++        assert!(serde_json::from_str::<Equalizer>(r#"{"bands":["loud"]}"#).is_err());
++        // Written as bands.
++        let written = serde_json::to_value(Equalizer::default()).unwrap();
++        assert_eq!(written, serde_json::json!({ "bands": vec![0.0; EQUALIZER_BANDS] }));
+     }
+ 
+     #[test]
+diff --git a/crates/host/src/spotify.rs b/crates/host/src/spotify.rs
+index e24adc1..0718147 100644
+--- a/crates/host/src/spotify.rs
++++ b/crates/host/src/spotify.rs
+@@ -418,7 +418,7 @@ enum Cab {
+         on: bool,
+         distance: f32,
+     },
+-    /// The player's tone (the cab's Settings › Sound): bass, mid and treble, dB each.
++    /// The player's tone (the cab's Settings › Sound): ten bands, dB each.
+     Equalizer {
+         #[serde(flatten)]
+         equalizer: Equalizer,
+diff --git a/crates/host/src/youtube.rs b/crates/host/src/youtube.rs
+index 896a296..8136055 100644
+--- a/crates/host/src/youtube.rs
++++ b/crates/host/src/youtube.rs
+@@ -86,7 +86,7 @@ pub enum Command {
+         #[serde(default)]
+         distance: f32,
+     },
+-    /// The player's tone (the cab's Settings › Sound): bass, mid and treble, dB each. The host's own (settings).
++    /// The player's tone (the cab's Settings › Sound): ten bands, dB each. The host's own (settings).
+     Equalizer {
+         #[serde(flatten)]
+         equalizer: Equalizer,
+diff --git a/crates/host/src/youtube_music.rs b/crates/host/src/youtube_music.rs
+index 9def615..a1268e8 100644
+--- a/crates/host/src/youtube_music.rs
++++ b/crates/host/src/youtube_music.rs
+@@ -781,7 +781,7 @@ enum Cab {
+         on: bool,
+         distance: f32,
+     },
+-    /// The player's tone (the cab's Settings › Sound): bass, mid and treble, dB each.
++    /// The player's tone (the cab's Settings › Sound): ten bands, dB each.
+     Equalizer {
+         #[serde(flatten)]
+         equalizer: Equalizer,
+diff --git a/ui/src/cabin/apps/musicWithGame.test.ts b/ui/src/cabin/apps/musicWithGame.test.ts
+new file mode 100644
+index 0000000..f5cc089
+--- /dev/null
++++ b/ui/src/cabin/apps/musicWithGame.test.ts
+@@ -0,0 +1,122 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { MusicPlayer } from './musicWithGame'
++
++/** A player playing or not, recording what it was asked; `volume` null: no volume to fade (plays at once). */
++function player() {
++  const state = { playing: true, pauses: 0, resumes: 0 }
++  const music: MusicPlayer = {
++    name: `player-${Math.random()}`,
++    playingHere: () => state.playing,
++    pauseHere: () => {
++      state.playing = false
++      state.pauses += 1
++    },
++    resumeHere: () => {
++      state.playing = true
++      state.resumes += 1
++    },
++    volume: () => null,
++    sendVolume: () => {},
++    setVolume: () => {},
++    subscribe: () => () => {},
++  }
++  return { music, state }
++}
++
++/** Everything loaded fresh with a window of its own (the stores read it), and the truck's screen's power at hand. */
++async function setup() {
++  // In the host (WebView2's `chrome.webview`, here a stand-in that does nothing): the stores' own setup reads it.
++  vi.stubGlobal('window', {
++    chrome: { webview: { addEventListener: () => {}, removeEventListener: () => {}, postMessage: () => {} } },
++  })
++  const { pauseMusicWithGame } = await import('./musicWithGame')
++  const { useCabin, useLive } = await import('../state/store')
++  const { INITIAL_POWER } = await import('../state/power')
++  const power = (phase: 'off' | 'splash' | 'connecting' | 'on') =>
++    useCabin.setState({ power: { phase, since: 0, observed: true } })
++  useCabin.setState({ power: INITIAL_POWER })
++  return { pauseMusicWithGame, useLive, power }
++}
++
++const telemetry = { paused: false } as never
++
++describe('the music with the electrics', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++  })
++  afterEach(() => {
++    vi.useRealTimers()
++    vi.unstubAllGlobals()
++    vi.resetModules()
++  })
++
++  it('stops as the electrics go off and plays on by itself once the screen is back up', async () => {
++    const { pauseMusicWithGame, useLive, power } = await setup()
++    useLive.setState({ telemetry, gameShown: true })
++    power('on')
++    const { music, state } = player()
++    const stop = pauseMusicWithGame(music)
++
++    power('off')
++    expect(state.playing).toBe(false)
++    expect(state.pauses).toBe(1)
++    // Not while the truck boots its screen, only once it is up.
++    power('splash')
++    power('connecting')
++    expect(state.resumes).toBe(0)
++    power('on')
++    expect(state.resumes).toBe(1)
++    expect(state.playing).toBe(true)
++    // Only once: the screen going off and on again with nothing playing before is left alone.
++    state.playing = false
++    power('off')
++    power('on')
++    expect(state.resumes).toBe(1)
++    stop()
++  })
++
++  it('leaves music the player had paused paused', async () => {
++    const { pauseMusicWithGame, useLive, power } = await setup()
++    useLive.setState({ telemetry, gameShown: true })
++    power('on')
++    const { music, state } = player()
++    state.playing = false
++    const stop = pauseMusicWithGame(music)
++    power('off')
++    power('on')
++    expect(state.resumes).toBe(0)
++    stop()
++  })
++
++  it('does not play on at the next game when the game itself was closed', async () => {
++    const { pauseMusicWithGame, useLive, power } = await setup()
++    useLive.setState({ telemetry, gameShown: true })
++    power('on')
++    const { music, state } = player()
++    const stop = pauseMusicWithGame(music)
++    // The game closing: its telemetry gone first, then the screen off (as `connectHost` does).
++    useLive.setState({ telemetry: null })
++    power('off')
++    useLive.setState({ telemetry })
++    power('on')
++    expect(state.resumes).toBe(0)
++    stop()
++  })
++
++  it('waits for the player to come back to the game if the screen is back up while they are away', async () => {
++    const { pauseMusicWithGame, useLive, power } = await setup()
++    useLive.setState({ telemetry, gameShown: true })
++    power('on')
++    const { music, state } = player()
++    const stop = pauseMusicWithGame(music)
++    power('off')
++    // Away (the game's window minimised) as the screen comes up: nothing yet.
++    useLive.setState({ gameShown: false })
++    power('on')
++    expect(state.resumes).toBe(0)
++    // Back: it plays on.
++    useLive.setState({ gameShown: true })
++    expect(state.resumes).toBe(1)
++    stop()
++  })
++})
+diff --git a/ui/src/cabin/apps/musicWithGame.ts b/ui/src/cabin/apps/musicWithGame.ts
+index 25f89c4..1a67d97 100644
+--- a/ui/src/cabin/apps/musicWithGame.ts
++++ b/ui/src/cabin/apps/musicWithGame.ts
+@@ -1,13 +1,14 @@
+ import { type LiveState, useCabin, useLive } from '../state/store'
+ import { fadeOutAndPause, playAndFadeIn } from './fade'
+-import { poweredOff, withGame } from './youtube/withGame'
++import { poweredOff, poweredOn, whenPoweredOn, withGame } from './youtube/withGame'
+ 
+ /**
+  * A music app with the game (YouTube, Spotify, Apple Music, YouTube Music; the rule: youtube/withGame.ts):
+  * the music playing here fades out and pauses while the player is away from the game (it's paused, or its
+  * window minimised) and plays on fading in as they come back, only if it was WestPlay that paused it; it stops at once
+- * as the truck's electrics go off, and nothing plays while they're off. Music playing elsewhere (Spotify on a
+- * phone) is left as it is.
++ * as the truck's electrics go off, and nothing plays while they're off; as the electrics come on again and the
++ * screen is back up, music that was playing when they went off plays on by itself (not when the game itself was
++ * closed: that is the next game's). Music playing elsewhere (Spotify on a phone) is left as it is.
+  */
+ export interface MusicPlayer {
+   /** Its name: one fade at a time for each (fade.ts). */
+@@ -56,11 +57,24 @@ export function pauseMusicWithGame(player: MusicPlayer): () => void {
+     }
+     if (!away) paused = false
+   })
++  // The music was playing as the electrics went off (the game still running): it plays on as the screen is back up.
++  let resumeOnPower = false
+   const power = useCabin.subscribe((cabin, before) => {
+-    if (!poweredOff(before.power.phase === 'off', cabin.power.phase === 'off')) return
+-    // Whatever it's doing, at once (no fade: owner 2026-10-21), and not played on after.
+-    if (player.playingHere()) player.pauseHere()
+-    paused = false
++    if (poweredOff(before.power.phase === 'off', cabin.power.phase === 'off')) {
++      // Whatever it's doing, at once (no fade: owner 2026-10-21). With the game closed (no telemetry any more) it
++      // isn't played on: the next game starts without it.
++      resumeOnPower = (player.playingHere() || paused) && useLive.getState().telemetry !== null
++      if (player.playingHere()) player.pauseHere()
++      paused = false
++      return
++    }
++    if (resumeOnPower && poweredOn(before.power.phase === 'on', cabin.power.phase === 'on')) {
++      resumeOnPower = false
++      const action = whenPoweredOn(true, isAway(useLive.getState()))
++      if (action === 'play') playAndFadeIn(player)
++      // The player is away from the game (paused, minimised): as for the game's pause, it plays on as they're back.
++      else if (action === 'later') paused = true
++    }
+   })
+   // Nothing plays while they're off: music that starts playing here then is paused as it starts.
+   const dark = player.subscribe((started) => {
+diff --git a/ui/src/cabin/apps/settings/SettingsApp.tsx b/ui/src/cabin/apps/settings/SettingsApp.tsx
+index 79c3bb0..6fd1ad5 100644
+--- a/ui/src/cabin/apps/settings/SettingsApp.tsx
++++ b/ui/src/cabin/apps/settings/SettingsApp.tsx
+@@ -20,7 +20,15 @@ import {
+ } from './glyphs'
+ import { type SettingsPage, useSettings } from './settings'
+ import './settings.css'
+-import { cabClock, EQUALIZER_BANDS, EQUALIZER_MOST, type Equalizer, isInHost, postToHost } from '../../../shared/host'
++import {
++  bandName,
++  cabClock,
++  EQUALIZER_FREQUENCIES,
++  EQUALIZER_MOST,
++  EQUALIZER_STEP,
++  isInHost,
++  postToHost,
++} from '../../../shared/host'
+ 
+ /**
+  * The Settings app, in iOS 26's Settings look: a large title, inset grouped cards, coloured tiles, chevrons
+@@ -343,11 +351,13 @@ function NowPlayingPage() {
+   )
+ }
+ 
+-/** Sound: the Equalizer (more of the sound's settings may come here). */
++/** Sound: the Equalizer, and Spatial Sound (the music from the truck's own speakers in 3D, or plain stereo). */
+ function SoundPage() {
+   const text = useText()
+   const open = useSettings((state) => state.open)
+   const custom = useCabin((state) => state.equalizerCustom)
++  const spatial = useCabin((state) => state.spatialSound)
++  const setSpatial = useCabin((state) => state.setSpatialSound)
+   return (
+     <Page title={text.settings.sound}>
+       <Group>
+@@ -357,6 +367,9 @@ function SoundPage() {
+           onOpen={() => open('equalizer')}
+         />
+       </Group>
++      <Group footer={text.settings.spatialSoundFooter}>
++        <SwitchRow label={text.settings.spatialSound} on={spatial} onToggle={setSpatial} />
++      </Group>
+     </Page>
+   )
+ }
+@@ -364,7 +377,8 @@ function SoundPage() {
+ /**
+  * The players' tone, as iOS 27's AirPods Equalizer (owner 2026-10-22): Recommended (the speakers as tuned) or
+  * Custom (the player's own curve, kept while Recommended plays); the track playing, to hear it by; and the
+- * curve over its three bands, Low, Mid and High, each dragged up or down (one for every truck, ±6 dB).
++ * curve over its ten bands (32 Hz to 16 kHz, an octave apart), each dragged up or down (one for every truck,
++ * ±12 dB in half-dB steps).
+  */
+ function EqualizerPage() {
+   const text = useText()
+@@ -372,7 +386,7 @@ function EqualizerPage() {
+   const curve = useCabin((state) => state.equalizer)
+   const choose = useCabin((state) => state.chooseEqualizer)
+   const reset = useCabin((state) => state.resetEqualizer)
+-  const flat = EQUALIZER_BANDS.every((band) => curve[band] === 0)
++  const flat = curve.bands.every((db) => db === 0)
+   // The music's spectrum, for the graph's waveform, while the page is open.
+   useEffect(() => {
+     if (!isInHost()) return
+@@ -442,18 +456,23 @@ function TrackRow() {
+   )
+ }
+ 
+-/** The graph's drawing, in its own units: its width and height, where the three bands stand across it, and
+- * how high a band is from its dB (flat in the middle, ±EQUALIZER_MOST at the top and bottom margins). */
++/** The graph's drawing, in its own units: its width and height, where the bands stand across it (each in a
++ * column of its own, `COLUMN` wide), and how high a band is from its dB (flat in the middle, ±EQUALIZER_MOST at
++ * the top and bottom margins). */
+ const GRAPH = { width: 600, height: 300, top: 24, bottom: 236 }
+-const BAND_AT: Record<keyof Equalizer, number> = { bass: 100, mid: 300, treble: 500 }
++const BANDS = EQUALIZER_FREQUENCIES.length
++const COLUMN = GRAPH.width / BANDS
++const bandAt = (band: number) => (band + 0.5) * COLUMN
+ const heightOf = (db: number) =>
+   (GRAPH.top + GRAPH.bottom) / 2 - (db / EQUALIZER_MOST) * ((GRAPH.bottom - GRAPH.top) / 2)
++/** A band's gain as the graph shows it: "+3.5", "-12", "0". */
++const shownDb = (db: number) => (db > 0 ? `+${db}` : String(db))
+ 
+ /**
+- * The curve over the three bands (Low, Mid, High: each a dashed line down the graph, the middle one's column
+- * shaded), as iOS draws it: the music's waveform along the middle and, Custom, a smooth line through each
+- * band's point over it. A band follows the finger up and down anywhere in its third of the graph, in whole
+- * dB; moving one picks Custom.
++ * The curve over the ten bands (each a dashed line down the graph, named by its frequency under it), as iOS
++ * draws it: the music's waveform along the middle and, Custom, a smooth line through each band's point over
++ * it. A band follows the finger up and down anywhere in its column of the graph, in steps of half a dB (its gain
++ * shown while it's held); moving one picks Custom.
+  */
+ function EqualizerGraph() {
+   const text = useText()
+@@ -461,35 +480,32 @@ function EqualizerGraph() {
+   const curve = useCabin((state) => state.equalizer)
+   const setBand = useCabin((state) => state.setEqualizerBand)
+   const svg = useRef<SVGSVGElement>(null)
+-  const [dragging, setDragging] = useState<keyof Equalizer | null>(null)
++  const [dragging, setDragging] = useState<number | null>(null)
+   const inGraph = (event: PointerEvent) => {
+     const matrix = svg.current?.getScreenCTM()?.inverse()
+     if (!matrix) return null
+     return new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix)
+   }
+-  const drag = (band: keyof Equalizer, event: PointerEvent) => {
++  const drag = (band: number, event: PointerEvent) => {
+     const at = inGraph(event)
+     if (!at) return
+     const middle = (GRAPH.top + GRAPH.bottom) / 2
+-    const db = Math.round(((middle - at.y) / ((GRAPH.bottom - GRAPH.top) / 2)) * EQUALIZER_MOST)
++    const db =
++      Math.round((((middle - at.y) / ((GRAPH.bottom - GRAPH.top) / 2)) * EQUALIZER_MOST) / EQUALIZER_STEP) *
++      EQUALIZER_STEP
+     const kept = Math.max(-EQUALIZER_MOST, Math.min(EQUALIZER_MOST, db))
+-    if (kept !== curve[band] || !custom) setBand(band, kept)
++    if (kept !== curve.bands[band] || !custom) setBand(band, kept)
+   }
+-  const shown = custom ? curve : { bass: 0, mid: 0, treble: 0 }
++  const shown = custom ? curve.bands : curve.bands.map(() => 0)
+   const points: [number, number][] = [
+-    [0, heightOf(shown.bass)],
+-    ...EQUALIZER_BANDS.map((band): [number, number] => [BAND_AT[band], heightOf(shown[band])]),
+-    [GRAPH.width, heightOf(shown.treble)],
++    [0, heightOf(shown[0])],
++    ...shown.map((db, band): [number, number] => [bandAt(band), heightOf(db)]),
++    [GRAPH.width, heightOf(shown[BANDS - 1])],
+   ]
+-  const names: Record<keyof Equalizer, string> = {
+-    bass: text.settings.low,
+-    mid: text.settings.mid,
+-    treble: text.settings.high,
+-  }
+   return (
+     <svg
+       ref={svg}
+-      className={dragging ? 'eq-graph dragging' : 'eq-graph'}
++      className={dragging !== null ? 'eq-graph dragging' : 'eq-graph'}
+       viewBox={`0 0 ${GRAPH.width} ${GRAPH.height}`}
+       role="group"
+       aria-label={text.settings.equalizer}
+@@ -498,51 +514,52 @@ function EqualizerGraph() {
+       onPointerDown={(event) => {
+         const at = inGraph(event)
+         if (!at) return
+-        const band: keyof Equalizer = at.x < GRAPH.width / 3 ? 'bass' : at.x < (2 * GRAPH.width) / 3 ? 'mid' : 'treble'
++        const band = Math.max(0, Math.min(BANDS - 1, Math.floor(at.x / COLUMN)))
+         event.currentTarget.setPointerCapture(event.pointerId)
+         setDragging(band)
+         drag(band, event)
+       }}
+-      onPointerMove={(event) => dragging && drag(dragging, event)}
++      onPointerMove={(event) => dragging !== null && drag(dragging, event)}
+       onPointerUp={() => setDragging(null)}
+       onPointerCancel={() => setDragging(null)}
+     >
+-      <defs>
+-        <linearGradient id="eq-middle-column" x1="0" y1="0" x2="0" y2="1">
+-          <stop offset="0" className="eq-column-edge" />
+-          <stop offset="0.5" className="eq-column-middle" />
+-          <stop offset="1" className="eq-column-edge" />
+-        </linearGradient>
+-      </defs>
+-      <rect x={200} y={0} width={200} height={GRAPH.bottom + 14} fill="url(#eq-middle-column)" />
+-      {EQUALIZER_BANDS.map((band) => (
+-        <line key={band} className="eq-band-line" x1={BAND_AT[band]} x2={BAND_AT[band]} y1={8} y2={GRAPH.bottom + 6} />
++      {EQUALIZER_FREQUENCIES.map((hz, band) => (
++        <line key={hz} className="eq-band-line" x1={bandAt(band)} x2={bandAt(band)} y1={8} y2={GRAPH.bottom + 6} />
+       ))}
+       <Waveform />
+       {custom && (
+         <>
+           <path className="eq-curve" d={smoothThrough(points)} />
+-          {EQUALIZER_BANDS.map((band) => (
++          {EQUALIZER_FREQUENCIES.map((hz, band) => (
+             <circle
+-              key={band}
++              key={hz}
+               className={dragging === band ? 'eq-point dragged' : 'eq-point'}
+-              cx={BAND_AT[band]}
+-              cy={heightOf(curve[band])}
+-              r={14}
++              cx={bandAt(band)}
++              cy={heightOf(curve.bands[band])}
++              r={12}
+               role="slider"
+-              aria-label={names[band]}
++              aria-label={`${bandName(hz)} Hz`}
+               aria-valuemin={-EQUALIZER_MOST}
+               aria-valuemax={EQUALIZER_MOST}
+-              aria-valuenow={curve[band]}
++              aria-valuenow={curve.bands[band]}
+             />
+           ))}
+         </>
+       )}
+-      {EQUALIZER_BANDS.map((band) => (
+-        <text key={band} className="eq-band-name" x={BAND_AT[band]} y={GRAPH.height - 16}>
+-          {names[band]}
++      {EQUALIZER_FREQUENCIES.map((hz, band) => (
++        <text key={hz} className="eq-band-name" x={bandAt(band)} y={GRAPH.height - 16}>
++          {bandName(hz)}
+         </text>
+       ))}
++      {custom && dragging !== null && (
++        <text
++          className="eq-value"
++          x={Math.max(48, Math.min(GRAPH.width - 48, bandAt(dragging)))}
++          y={Math.max(18, heightOf(curve.bands[dragging]) - 24)}
++        >
++          {shownDb(curve.bands[dragging])} dB
++        </text>
++      )}
+     </svg>
+   )
+ }
+diff --git a/ui/src/cabin/apps/settings/settings.css b/ui/src/cabin/apps/settings/settings.css
+index 858797c..f407731 100644
+--- a/ui/src/cabin/apps/settings/settings.css
++++ b/ui/src/cabin/apps/settings/settings.css
+@@ -516,13 +516,22 @@
+ }
+ 
+ .eq-point.dragged {
+-  r: 17px;
++  r: 15px;
++}
++
++/* The gain of the band held, over its point. */
++.eq-value {
++  fill: var(--apple-label);
++  font-size: calc(20px * var(--text-scale, 1));
++  font-variant-numeric: tabular-nums;
++  text-anchor: middle;
++  pointer-events: none;
+ }
+ 
+ .eq-band-name {
+   fill: var(--apple-label-tertiary);
+-  font-size: calc(22px * var(--text-scale, 1));
+-  letter-spacing: 0.06em;
++  font-size: calc(18px * var(--text-scale, 1));
++  letter-spacing: 0.02em;
+   text-transform: uppercase;
+   text-anchor: middle;
+ }
+diff --git a/ui/src/cabin/apps/youtube/withGame.test.ts b/ui/src/cabin/apps/youtube/withGame.test.ts
+index 2e5fad5..63c5e33 100644
+--- a/ui/src/cabin/apps/youtube/withGame.test.ts
++++ b/ui/src/cabin/apps/youtube/withGame.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from 'vitest'
+-import { poweredOff, withGame } from './withGame'
++import { poweredOff, poweredOn, whenPoweredOn, withGame } from './withGame'
+ 
+ describe('withGame', () => {
+   it('pauses a video playing as the player goes away from the game', () => {
+@@ -33,3 +33,23 @@ describe('poweredOff', () => {
+     expect(poweredOff(true, false)).toBe(false)
+   })
+ })
++
++describe('poweredOn', () => {
++  it('is the moment the screen is back up, not while it stays up or goes down', () => {
++    expect(poweredOn(false, true)).toBe(true)
++    expect(poweredOn(true, true)).toBe(false)
++    expect(poweredOn(true, false)).toBe(false)
++  })
++})
++
++describe('whenPoweredOn', () => {
++  it('plays on the music that was stopped as the electrics went off', () => {
++    expect(whenPoweredOn(true, false)).toBe('play')
++    expect(whenPoweredOn(false, false)).toBe(null)
++  })
++
++  it('leaves it for the player coming back to the game when they are away', () => {
++    expect(whenPoweredOn(true, true)).toBe('later')
++    expect(whenPoweredOn(false, true)).toBe(null)
++  })
++})
+diff --git a/ui/src/cabin/apps/youtube/withGame.ts b/ui/src/cabin/apps/youtube/withGame.ts
+index db5ec24..196c0e2 100644
+--- a/ui/src/cabin/apps/youtube/withGame.ts
++++ b/ui/src/cabin/apps/youtube/withGame.ts
+@@ -19,8 +19,22 @@ export function withGame(
+   return null
+ }
+ 
+-/** Whether the truck's electrics just went off: the video stops (paused, and left so: nothing plays it on
+- * again by itself, not the game coming back nor the power). */
++/** Whether the truck's electrics just went off: the video stops (paused: the game coming back doesn't play it on,
++ * but the screen coming back up does, `poweredOn`). */
+ export function poweredOff(wasOff: boolean, off: boolean): boolean {
+   return off && !wasOff
+ }
++
++/** Whether the screen just came back up (its power sequence over: `on`) after the electrics were off: the music
++ * that was stopped as they went off plays on, as the radio of a car does as the engine starts. */
++export function poweredOn(wasOn: boolean, on: boolean): boolean {
++  return on && !wasOn
++}
++
++/** What to do with the music as the screen comes back up: play on if it was playing when the electrics went off
++ * (`resume`), only with the game in front of the player (`away`: not; it's left for them coming back, as when
++ * the game's pause stopped it). */
++export function whenPoweredOn(resume: boolean, away: boolean): 'play' | 'later' | null {
++  if (!resume) return null
++  return away ? 'later' : 'play'
++}
+diff --git a/ui/src/cabin/state/connectHost.test.ts b/ui/src/cabin/state/connectHost.test.ts
+index 14578dd..6495e16 100644
+--- a/ui/src/cabin/state/connectHost.test.ts
++++ b/ui/src/cabin/state/connectHost.test.ts
+@@ -74,35 +74,69 @@ describe('connectHost', () => {
+     vi.stubGlobal('window', { chrome: { webview: webview.bridge } })
+     const { connectHost, useCabin } = await import('./store')
+     const disconnect = connectHost(() => 0)
+-    expect(useCabin.getState().equalizer).toEqual({ bass: 0, mid: 0, treble: 0 })
++    const flat = Array(10).fill(0)
++    const withBands = (changes: Record<number, number>) => flat.map((db, i) => changes[i] ?? db)
++    expect(useCabin.getState().equalizer).toEqual({ bands: flat })
+ 
+-    // As the host keeps it; whatever it sends, each band whole dB within ±6 (none said: flat).
+-    webview.send({ type: 'settings', truckStrip: 'auto', equalizer: { bass: -3, mid: 2.4, treble: 40 } })
+-    expect(useCabin.getState().equalizer).toEqual({ bass: -3, mid: 2, treble: 6 })
++    // As the host keeps it; whatever it sends, each band on a half dB step within ±12 (none said: flat).
++    webview.send({
++      type: 'settings',
++      truckStrip: 'auto',
++      equalizer: { bands: [-3, 2.4, 40, -40, Number.NaN, 1.74, 0.2, -0.2] },
++    })
++    expect(useCabin.getState().equalizer).toEqual({ bands: [-3, 2.5, 12, -12, 0, 1.5, 0, 0, 0, 0] })
+     webview.send({ type: 'settings', truckStrip: 'auto' })
+-    expect(useCabin.getState().equalizer).toEqual({ bass: 0, mid: 0, treble: 0 })
++    expect(useCabin.getState().equalizer).toEqual({ bands: flat })
+ 
+     expect(useCabin.getState().equalizerCustom).toBe(false)
+ 
+     // A band set: Custom, and the whole curve to the host, to keep and play.
+-    useCabin.getState().setEqualizerBand('bass', -4)
+-    expect(useCabin.getState().equalizer).toEqual({ bass: -4, mid: 0, treble: 0 })
++    useCabin.getState().setEqualizerBand(0, -4)
++    expect(useCabin.getState().equalizer).toEqual({ bands: withBands({ 0: -4 }) })
+     expect(useCabin.getState().equalizerCustom).toBe(true)
+-    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: true, bass: -4, mid: 0, treble: 0 })
+-    useCabin.getState().setEqualizerBand('treble', 9)
+-    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: true, bass: -4, mid: 0, treble: 6 })
++    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: true, bands: withBands({ 0: -4 }) })
++    useCabin.getState().setEqualizerBand(9, 20)
++    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: true, bands: withBands({ 0: -4, 9: 12 }) })
++    useCabin.getState().setEqualizerBand(5, -7.3)
++    expect(webview.posted.at(-1)).toEqual({
++      type: 'equalizer',
++      custom: true,
++      bands: withBands({ 0: -4, 5: -7.5, 9: 12 }),
++    })
+     // Recommended: the curve kept, flat played.
+     useCabin.getState().chooseEqualizer(false)
+-    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: false, bass: -4, mid: 0, treble: 6 })
++    expect(webview.posted.at(-1)).toEqual({
++      type: 'equalizer',
++      custom: false,
++      bands: withBands({ 0: -4, 5: -7.5, 9: 12 }),
++    })
+     webview.send({
+       type: 'settings',
+       truckStrip: 'auto',
+-      equalizer: { bass: -4, mid: 0, treble: 6 },
++      equalizer: { bands: withBands({ 0: -4, 9: 12 }) },
+       equalizerCustom: true,
+     })
+     expect(useCabin.getState().equalizerCustom).toBe(true)
+     useCabin.getState().resetEqualizer()
+-    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: true, bass: 0, mid: 0, treble: 0 })
++    expect(webview.posted.at(-1)).toEqual({ type: 'equalizer', custom: true, bands: flat })
++    disconnect()
++  })
++
++  it('keeps Spatial Sound as the host has it (on unless it says off), and hands the switch to it', async () => {
++    const webview = fakeWebView()
++    vi.stubGlobal('window', { chrome: { webview: webview.bridge } })
++    const { connectHost, useCabin } = await import('./store')
++    const disconnect = connectHost(() => 0)
++    expect(useCabin.getState().spatialSound).toBe(true)
++    webview.send({ type: 'settings', truckStrip: 'auto', spatial: false })
++    expect(useCabin.getState().spatialSound).toBe(false)
++    webview.send({ type: 'settings', truckStrip: 'auto' })
++    expect(useCabin.getState().spatialSound).toBe(true)
++    useCabin.getState().setSpatialSound(false)
++    expect(useCabin.getState().spatialSound).toBe(false)
++    expect(webview.posted.at(-1)).toEqual({ type: 'spatial', on: false })
++    useCabin.getState().setSpatialSound(true)
++    expect(webview.posted.at(-1)).toEqual({ type: 'spatial', on: true })
+     disconnect()
+   })
+ 
+diff --git a/ui/src/cabin/state/store.ts b/ui/src/cabin/state/store.ts
+index 7940300..9542411 100644
+--- a/ui/src/cabin/state/store.ts
++++ b/ui/src/cabin/state/store.ts
+@@ -80,6 +80,9 @@ interface CabinState {
+    * (Recommended, flat): kept with WestPlay's settings, the host sends them. */
+   equalizer: Equalizer
+   equalizerCustom: boolean
++  /** Spatial Sound (Settings › Sound): the music from the truck's own speakers in 3D (on, as it always was), or the
++   * page's own stereo: kept with WestPlay's settings, the host sends it. */
++  spatialSound: boolean
+   power: PowerState
+   /**
+    * The screen is handed back to the truck (its stock screen shows, with WestPlay's button to come back),
+@@ -92,9 +95,11 @@ interface CabinState {
+   setDashboardWidget(widget: DashboardWidget, shown: boolean): void
+   setAlbumArt(shown: boolean): void
+   setTextSize(step: number): void
+-  /** One band of the curve, set in Settings › Equalizer (choosing Custom): played by every player, and kept with
+-   * WestPlay's settings. */
+-  setEqualizerBand(band: keyof Equalizer, db: number): void
++  /** One band of the curve (by its place among `EQUALIZER_FREQUENCIES`), set in Settings › Equalizer (choosing
++   * Custom): played by every player, and kept with WestPlay's settings. */
++  setEqualizerBand(band: number, db: number): void
++  /** Spatial Sound on or off, set in Settings › Sound: played by every player, and kept with WestPlay's settings. */
++  setSpatialSound(on: boolean): void
+   /** Custom (the curve plays) or Recommended (flat), the curve kept either way. */
+   chooseEqualizer(custom: boolean): void
+   /** The curve flat again. */
+@@ -126,6 +131,7 @@ export const useCabin = create<CabinState>()(
+       oemMode: 'auto',
+       equalizer: FLAT,
+       equalizerCustom: false,
++      spatialSound: true,
+       power: INITIAL_POWER,
+       navigate: (action) => set((state) => ({ navigation: navigate(state.navigation, action) })),
+       setAppearanceMode: (appearanceMode) => set({ appearanceMode }),
+@@ -139,10 +145,16 @@ export const useCabin = create<CabinState>()(
+       setAlbumArt: (albumArt) => set({ albumArt }),
+       setTextSize: (step) => set({ textSize: toTextSize(step) }),
+       setEqualizerBand: (band, db) => {
+-        const equalizer = toEqualizer({ ...useCabin.getState().equalizer, [band]: db })
++        const bands = [...useCabin.getState().equalizer.bands]
++        bands[band] = db
++        const equalizer = toEqualizer({ bands })
+         set({ equalizer, equalizerCustom: true })
+         if (isInHost()) postToHost({ type: 'equalizer', custom: true, ...equalizer })
+       },
++      setSpatialSound: (on) => {
++        set({ spatialSound: on })
++        if (isInHost()) postToHost({ type: 'spatial', on })
++      },
+       chooseEqualizer: (custom) => {
+         set({ equalizerCustom: custom })
+         if (isInHost()) postToHost({ type: 'equalizer', custom, ...useCabin.getState().equalizer })
+@@ -461,6 +473,7 @@ function receiveHostMessage(now: () => number): (message: HostMessage) => void {
+         useCabin.setState({
+           equalizer: toEqualizer(message.equalizer),
+           equalizerCustom: message.equalizerCustom === true,
++          spatialSound: message.spatial !== false,
+         })
+         setIcons({
+           iconSet: message.iconSet ?? null,
+diff --git a/ui/src/cabin/state/strings.ts b/ui/src/cabin/state/strings.ts
+index 273990f..e4898c6 100644
+--- a/ui/src/cabin/state/strings.ts
++++ b/ui/src/cabin/state/strings.ts
+@@ -455,6 +455,9 @@ export interface Strings {
+     recommended: string
+     custom: string
+     equalizerFooter: string
++    /** Spatial Sound: the switch, and what it does. */
++    spatialSound: string
++    spatialSoundFooter: string
+     low: string
+     mid: string
+     high: string
+@@ -931,6 +934,9 @@ export const STRINGS: Record<Language, Strings> = {
+       custom: 'Custom',
+       equalizerFooter:
+         'WestPlay plays your music through each truck’s own speakers, tuned for its cab. If you prefer a different sound, you can customise how every music app sounds, in every truck.',
++      spatialSound: 'Spatial Sound',
++      spatialSoundFooter:
++        'Plays your music through each truck’s own speakers, placed in its cab and heard from the driver’s seat, so the sound moves as you look around. Turned off, the music plays in plain stereo and the Equalizer still applies.',
+       low: 'Low',
+       mid: 'Mid',
+       high: 'High',
+@@ -1417,6 +1423,9 @@ export const STRINGS: Record<Language, Strings> = {
+       custom: 'Özel',
+       equalizerFooter:
+         'WestPlay müziğini her kamyonun kendi hoparlörlerinden, kabinine göre ayarlanmış olarak çalar. Farklı bir ses istersen, her müzik uygulamasının her kamyonda nasıl çalacağını özelleştirebilirsin.',
++      spatialSound: 'Uzamsal Ses',
++      spatialSoundFooter:
++        'Müziği her kamyonun kabinine yerleştirilmiş kendi hoparlörlerinden, sürücü koltuğundan duyulacak şekilde çalar; etrafına baktıkça ses de yer değiştirir. Kapalıyken müzik düz stereo çalar ve Ekolayzır yine uygulanır.',
+       low: 'Düşük',
+       mid: 'Orta',
+       high: 'Yüksek',
+diff --git a/ui/src/shared/host.ts b/ui/src/shared/host.ts
+index 82016f4..f2dd52b 100644
+--- a/ui/src/shared/host.ts
++++ b/ui/src/shared/host.ts
+@@ -108,6 +108,8 @@ export type HostMessage =
+       /** The player's own tone curve (Settings › Equalizer), and whether it plays (Custom) or not (Recommended). */
+       equalizer?: Equalizer
+       equalizerCustom?: boolean
++      /** Spatial Sound (Settings › Sound): on unless the host says it's off. */
++      spatial?: boolean
+     }
+   /** The player's own wallpapers and icon sets (shared/customize.ts), their files at `CABIN_FILES`. */
+   | { type: 'customize'; wallpapers: CustomWallpaper[]; iconSets: IconSet[] }
+@@ -239,29 +241,39 @@ export interface GameWeather {
+ export type Sky = 'clear' | 'rain'
+ 
+ /** Messages from the cabin page to the host. */
+-/** The players' tone controls, as a car stereo's: bass, mid and treble, in dB each (`EQUALIZER_MOST` either way;
+- * the host's `speakers::Equalizer`). */
++/** The players' tone controls, a graphic equalizer's: one gain in dB for each of its bands, `EQUALIZER_FREQUENCIES`
++ * in order, `EQUALIZER_MOST` either way in steps of `EQUALIZER_STEP` (the host's `speakers::Equalizer`; bass, mid
++ * and treble up to WestPlay 2.1.4). */
+ export interface Equalizer {
+-  bass: number
+-  mid: number
+-  treble: number
++  bands: number[]
+ }
+ 
+-export const EQUALIZER_BANDS = ['bass', 'mid', 'treble'] as const satisfies readonly (keyof Equalizer)[]
++/** Where each band is centred, Hz (the host's `Equalizer::FREQUENCIES`). */
++export const EQUALIZER_FREQUENCIES = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000] as const
++
++/** A band's name on the graph: "32", "125", "1k", "16k". */
++export const bandName = (hz: number) => (hz >= 1000 ? `${hz / 1000}k` : String(hz))
+ 
+ /** How far each band goes, dB (the host's `Equalizer::MOST`). */
+-export const EQUALIZER_MOST = 6
++export const EQUALIZER_MOST = 12
++
++/** The steps a band is set in, dB (the host's `Equalizer::STEP`). */
++export const EQUALIZER_STEP = 0.5
+ 
+-export const FLAT: Equalizer = { bass: 0, mid: 0, treble: 0 }
++export const FLAT: Equalizer = { bands: EQUALIZER_FREQUENCIES.map(() => 0) }
++
++/** One band's gain within the range, on its nearest step (anything that isn't a number flat). */
++export function toBand(db: unknown): number {
++  if (typeof db !== 'number' || !Number.isFinite(db)) return 0
++  return Math.max(-EQUALIZER_MOST, Math.min(EQUALIZER_MOST, Math.round(db / EQUALIZER_STEP) * EQUALIZER_STEP)) + 0
++}
+ 
+-/** The tone as the host may send it: each band a whole number of dB within the range (anything else flat). */
++/** The tone as the host may send it: each band on a step within the range (anything else flat; a band not
++ * said flat, one past the last left out). */
+ export function toEqualizer(value: unknown): Equalizer {
+-  const told = (value ?? {}) as Partial<Record<keyof Equalizer, unknown>>
+-  const band = (db: unknown) =>
+-    typeof db === 'number' && Number.isFinite(db)
+-      ? Math.max(-EQUALIZER_MOST, Math.min(EQUALIZER_MOST, Math.round(db)))
+-      : 0
+-  return { bass: band(told.bass), mid: band(told.mid), treble: band(told.treble) }
++  const told = (value as { bands?: unknown } | null | undefined)?.bands
++  const bands = Array.isArray(told) ? (told as unknown[]) : []
++  return { bands: EQUALIZER_FREQUENCIES.map((_, i) => toBand(bands[i])) }
+ }
+ 
+ export type PageMessage =
+@@ -278,6 +290,9 @@ export type PageMessage =
+   /** The players' tone, set in Settings › Equalizer: the player's curve, and whether it plays (Custom) or the
+    * speakers as tuned (Recommended); kept with WestPlay's settings and played by every player. */
+   | ({ type: 'equalizer'; custom: boolean } & Equalizer)
++  /** Spatial Sound, set in Settings › Sound: the music from the truck's own speakers in 3D (on), or the page's
++   * own stereo; kept with WestPlay's settings. */
++  | { type: 'spatial'; on: boolean }
+   /** The music's spectrum wanted (Settings › Equalizer open) or not: the host answers `spectrum` as it plays. */
+   | { type: 'spectrum'; on: boolean }
+   /** Whether what's under the cursor is light: the host draws it dark there. */
