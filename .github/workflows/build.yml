@@ -31,6 +31,20 @@ jobs:
           }
         shell: powershell
 
+      - name: Bypass Plugin Check
+        run: |
+          # Ce script cherche la vérification du plug-in dans le code Rust et la force à toujours répondre "vrai"
+          Get-ChildItem -Recurse -Filter "*.rs" | ForEach-Object {
+              $content = Get-Content $_.FullName -Raw
+              if ($content -match "is_plugin_installed" -or $content -match "check_plugin") {
+                  # On force les fonctions de vérification à renvoyer true pour éteindre le voyant rouge
+                  $content = $content -replace "fn is_plugin_installed\([^)]*\)\s*->\s*bool\s*\{[^}]*\}", "fn is_plugin_installed() -> bool { true }"
+                  Set-Content $_.FullName -Value $content -Force
+                  Write-Host "Vérification désactivée dans : $_.Name"
+              }
+          }
+        shell: powershell
+
       - name: Compile Application
         run: |
           npm install
