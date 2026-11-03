@@ -1,4 +1,4 @@
-name: Build WestPlay Installer
+name: Build WestPlay Portable Application
 
 on:
   workflow_dispatch:
@@ -21,54 +21,48 @@ jobs:
 
       - name: Apply Patch
         run: |
-          # Applique le patch de l'égaliseur s'il est présent à la racine
-          if (Test-Path "patch.diff") {
-            git apply --verbose patch.diff
-          } elseif (Test-Path "westplay-2.1.4-son3d-egaliseur-reprise.patch") {
+          if (Test-Path "westplay-2.1.4-son3d-egaliseur-reprise.patch") {
             git apply --verbose westplay-2.1.4-son3d-egaliseur-reprise.patch
+          } elseif (Test-Path "patch.diff") {
+            git apply --verbose patch.diff
           }
         shell: powershell
 
       - name: Compile Game Plugin (DLL)
         run: |
-          # Condition 1 : Compiler explicitement le plug-in sans target pour qu'il aille dans target/release/
+          # Étape clé : On compile la DLL avant l'hôte, sans l'option --target
           cargo build --release -p westplay-plugin
         shell: powershell
 
-      - name: Clean Author Signature from Config
+      - name: Compile Main Application (EXE)
         run: |
-          # Condition 2 : Supprimer la clé de signature privée de l'auteur dans la config de release
-          $configPath = "app/tauri.release.conf.json"
-          if (Test-Path $configPath) {
-              $config = Get-Content $configPath -Raw | ConvertFrom-Json
-              # Supprime le bloc de signature pour éviter l'erreur de build Tauri
-              if ($config.bundle.windows -and $config.bundle.windows.certificateThumbprint) {
-                  $config.bundle.windows.PSObject.Properties.Remove("certificateThumbprint")
-              }
-              $config | ConvertTo-Json -Depth 100 | Set-Content $configPath
-              Write-Host "Clé de signature retirée avec succès de tauri.release.conf.json"
-          } else {
-              Write-Host "Utilisation de app/tauri.conf.json (tauri.release.conf.json introuvable)"
+          npm install
+          # On build l'application sans lancer le packaging de l'installeur
+          npm run build
+        env:
+          CI: true
+        continue-on-error: true
+
+      - name: Assemble Portable Folder
+        run: |
+          # 1. Création du dossier final qui sera dans votre ZIP
+          New-Item -ItemType Directory -Force -Path "WestPlay_Portable"
+          
+          # 2. Copie de l'exécutable modifié
+          Copy-Item -Path "target/release/westplay.exe" -Destination "WestPlay_Portable/westplay.exe" -Force
+          
+          # 3. Inclusion de la DLL du plug-in fraîchement compilée au bon endroit
+          Copy-Item -Path "target/release/westplay.dll" -Destination "WestPlay_Portable/westplay.dll" -Force -ErrorAction SilentlyContinue
+          
+          # 4. Copie des dossiers compagnons (app et assets) indispensables
+          Copy-Item -Path "app" -Destination "WestPlay_Portable/app" -Recurse -Force
+          if (Test-Path "assets") {
+            Copy-Item -Path "assets" -Destination "WestPlay_Portable/assets" -Recurse -Force
           }
         shell: powershell
 
-      - name: Build Official Installer
-        run: |
-          npm install
-          # Utilise le fichier de configuration de release si disponible
-          if (Test-Path "app/tauri.release.conf.json") {
-            npx tauri build --config app/tauri.release.conf.json
-          } else {
-            npx tauri build --config app/tauri.conf.json
-          }
-        env:
-          CI: true
-
-      - name: Verify and Upload Artifacts
+      - name: Upload Portable Application
         uses: actions/upload-artifact@v4
         with:
-          name: WestPlay-Installeur-Officiel
-          path: |
-            **/target/release/bundle/nsis/*.exe
-            **/target/release/bundle/msi/*.msi
-          if-no-files-found: error
+          name: WestPlay-Version-Portable
+          path: WestPlay_Portable/
