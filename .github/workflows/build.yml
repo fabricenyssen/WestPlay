@@ -1,4 +1,7 @@
-name: Build WestPlay Portable Application
+# À placer dans ton fork de WestPlay : .github/workflows/build-installer.yml
+# Lancement : onglet « Actions » du dépôt, « Build WestPlay installer », bouton « Run workflow ».
+# Résultat : l'installeur .exe en téléchargement dans « Artifacts », en bas de la page de l'exécution.
+name: Build WestPlay installer
 
 on:
   workflow_dispatch:
@@ -8,77 +11,71 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Si le fichier .patch est à la racine du dépôt : il est appliqué, sauf s'il l'est déjà (alors il est
+      # ignoré). S'il n'est ni applicable ni déjà appliqué, la construction s'arrête ici.
+      - name: Apply the patch
+        shell: bash
+        run: |
+          patch=$(ls westplay-*.patch 2>/dev/null | head -n 1 || true)
+          if [ -z "$patch" ]; then
+            echo "No patch file: building the sources as they are."
+          elif git apply --check "$patch" 2>/dev/null; then
+            git apply "$patch"
+            echo "Applied $patch"
+          elif git apply --check -R "$patch" 2>/dev/null; then
+            echo "$patch is already applied."
+          else
+            echo "::error::$patch neither applies nor is already applied."
+            exit 1
+          fi
+
+      - name: Install packages
+        run: npm install
+
+      # 1. Le plugin du jeu (westplay.dll). L'installeur l'embarque depuis target/release/westplay.dll : il doit
+      #    exister AVANT la construction de l'installeur, et sans « --target » (sinon il est ailleurs).
+      - name: Build the game plugin
+        run: cargo build --release -p westplay-plugin
+
+      - name: Check the plugin is where the installer expects it
+        shell: bash
+        run: |
+          test -f target/release/westplay.dll || { echo "::error::target/release/westplay.dll is missing"; exit 1; }
+          ls -l target/release/westplay.dll
+
+      # 2. L'application et son installeur, avec la configuration « release » (qui y met westplay.dll).
+      #    « createUpdaterArtifacts » est coupé : il demande la clé privée de l'auteur d'origine, qu'on n'a pas.
+      #    On appelle tauri directement : le script « npm run build » lance un fichier PowerShell
+      #    (tools/dev/sweep.ps1) qui n'est pas dans le dépôt public.
+      - name: Build the installer
+        shell: bash
+        run: >
+          npx tauri build
+          --config app/tauri.release.conf.json
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # 3. Contrôle : westplay.dll doit se trouver dans l'installeur (sinon l'appli dira « plugin introuvable »).
+      - name: Check the installer holds the plugin
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path target -Recurse -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'No installer was built.' }
+          Write-Host "Installer: $($exe.FullName)"
+          $list = & "C:\Program Files\7-Zip\7z.exe" l $exe.FullName
+          $list | Select-String -Pattern 'westplay\.(dll|exe)'
+          if (-not ($list | Select-String -Pattern 'westplay\.dll')) { throw 'westplay.dll is not in the installer.' }
+
+      - uses: actions/upload-artifact@v4
         with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Apply Patch
-        run: |
-          if (Test-Path "westplay-2.1.4-son3d-egaliseur-reprise.patch") {
-            git apply --verbose westplay-2.1.4-son3d-egaliseur-reprise.patch
-          } elseif (Test-Path "patch.diff") {
-            git apply --verbose patch.diff
-          }
-        shell: powershell
-
-      - name: Compile Frontend (UI React)
-        run: |
-          # On installe et on compile l'interface dans le sous-dossier ui
-          cd ui
-          npm install
-          npm run build
-        env:
-          CI: true
-
-      - name: Compile Game Plugin (DLL)
-        run: |
-          # Condition 1 : On compile la DLL sans option --target
-          cargo build --release -p westplay-plugin
-        shell: powershell
-
-      - name: Compile Main Engine (EXE)
-        run: |
-          # On compile le moteur Rust brut de l'application (l'hôte) sans passer par Tauri
-          cargo build --release -p westplay-host
-        shell: powershell
-        continue-on-error: true
-
-      - name: Assemble Portable Folder
-        run: |
-          # 1. Création du dossier de destination finale
-          New-Item -ItemType Directory -Force -Path "WestPlay_Portable"
-          
-          # 2. Copie du fichier westplay.exe (moteur principal compilé)
-          if (Test-Path "target/release/westplay-host.exe") {
-            Copy-Item -Path "target/release/westplay-host.exe" -Destination "WestPlay_Portable/westplay.exe" -Force
-          } elseif (Test-Path "target/release/westplay.exe") {
-            Copy-Item -Path "target/release/westplay.exe" -Destination "WestPlay_Portable/westplay.exe" -Force
-          }
-          
-          # 3. Copie de la DLL du plug-in (notre fameuse Condition 1)
-          Copy-Item -Path "target/release/westplay_plugin.dll" -Destination "WestPlay_Portable/westplay.dll" -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "target/release/westplay.dll" -Destination "WestPlay_Portable/westplay.dll" -Force -ErrorAction SilentlyContinue
-          
-          # 4. Copie des fichiers d'interface fraîchement compilés
-          New-Item -ItemType Directory -Force -Path "WestPlay_Portable/ui"
-          Copy-Item -Path "ui/dist/*" -Destination "WestPlay_Portable/ui" -Recurse -Force -ErrorAction SilentlyContinue
-          
-          # 5. Copie des dossiers compagnons d'origine indispensables
-          Copy-Item -Path "app" -Destination "WestPlay_Portable/app" -Recurse -Force
-          if (Test-Path "assets") {
-            Copy-Item -Path "assets" -Destination "WestPlay_Portable/assets" -Recurse -Force
-          }
-        shell: powershell
-
-      - name: Upload Portable Application
-        uses: actions/upload-artifact@v4
-        with:
-          name: WestPlay-Version-Portable-Finale
-          path: WestPlay_Portable/
+          name: WestPlay-installer
+          path: target/**/bundle/nsis/*-setup.exe
+          if-no-files-found: error
