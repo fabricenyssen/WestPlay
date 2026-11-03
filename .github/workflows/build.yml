@@ -28,33 +28,49 @@ jobs:
           }
         shell: powershell
 
-      - name: Compile Game Plugin (DLL)
+      - name: Compile Frontend (UI React)
         run: |
-          # Étape clé : On compile la DLL avant l'hôte, sans l'option --target
-          cargo build --release -p westplay-plugin
-        shell: powershell
-
-      - name: Compile Main Application (EXE)
-        run: |
+          # On installe et on compile l'interface dans le sous-dossier ui
+          cd ui
           npm install
-          # On build l'application sans lancer le packaging de l'installeur
           npm run build
         env:
           CI: true
+
+      - name: Compile Game Plugin (DLL)
+        run: |
+          # Condition 1 : On compile la DLL sans option --target
+          cargo build --release -p westplay-plugin
+        shell: powershell
+
+      - name: Compile Main Engine (EXE)
+        run: |
+          # On compile le moteur Rust brut de l'application (l'hôte) sans passer par Tauri
+          cargo build --release -p westplay-host
+        shell: powershell
         continue-on-error: true
 
       - name: Assemble Portable Folder
         run: |
-          # 1. Création du dossier final qui sera dans votre ZIP
+          # 1. Création du dossier de destination finale
           New-Item -ItemType Directory -Force -Path "WestPlay_Portable"
           
-          # 2. Copie de l'exécutable modifié
-          Copy-Item -Path "target/release/westplay.exe" -Destination "WestPlay_Portable/westplay.exe" -Force
+          # 2. Copie du fichier westplay.exe (moteur principal compilé)
+          if (Test-Path "target/release/westplay-host.exe") {
+            Copy-Item -Path "target/release/westplay-host.exe" -Destination "WestPlay_Portable/westplay.exe" -Force
+          } elseif (Test-Path "target/release/westplay.exe") {
+            Copy-Item -Path "target/release/westplay.exe" -Destination "WestPlay_Portable/westplay.exe" -Force
+          }
           
-          # 3. Inclusion de la DLL du plug-in fraîchement compilée au bon endroit
+          # 3. Copie de la DLL du plug-in (notre fameuse Condition 1)
+          Copy-Item -Path "target/release/westplay_plugin.dll" -Destination "WestPlay_Portable/westplay.dll" -Force -ErrorAction SilentlyContinue
           Copy-Item -Path "target/release/westplay.dll" -Destination "WestPlay_Portable/westplay.dll" -Force -ErrorAction SilentlyContinue
           
-          # 4. Copie des dossiers compagnons (app et assets) indispensables
+          # 4. Copie des fichiers d'interface fraîchement compilés
+          New-Item -ItemType Directory -Force -Path "WestPlay_Portable/ui"
+          Copy-Item -Path "ui/dist/*" -Destination "WestPlay_Portable/ui" -Recurse -Force -ErrorAction SilentlyContinue
+          
+          # 5. Copie des dossiers compagnons d'origine indispensables
           Copy-Item -Path "app" -Destination "WestPlay_Portable/app" -Recurse -Force
           if (Test-Path "assets") {
             Copy-Item -Path "assets" -Destination "WestPlay_Portable/assets" -Recurse -Force
@@ -64,5 +80,5 @@ jobs:
       - name: Upload Portable Application
         uses: actions/upload-artifact@v4
         with:
-          name: WestPlay-Version-Portable
+          name: WestPlay-Version-Portable-Finale
           path: WestPlay_Portable/
