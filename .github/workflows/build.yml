@@ -19,6 +19,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y
+        shell: powershell
+
       - name: Apply Patch
         run: |
           if (Test-Path "patch.diff") {
@@ -34,25 +39,35 @@ jobs:
           CI: true
         continue-on-error: true
 
-      - name: Create Manual Delivery Folder
+      - name: Create Inno Setup Script
         run: |
-          # 1. On crée un dossier propre sur le serveur pour rassembler les pièces
-          New-Item -ItemType Directory -Force -Path "WestPlay_Modifie_Final"
-          
-          # 2. On y copie l'application modifiée que GitHub a réussi à compiler
-          Copy-Item -Path "target/release/westplay.exe" -Destination "WestPlay_Modifie_Final/westplay.exe" -Force
-          
-          # 3. On y ajoute le dossier du plug-in pour que le voyant rouge s'éteigne
-          Copy-Item -Path "app" -Destination "WestPlay_Modifie_Final/app" -Recurse -Force
-          
-          # 4. On y ajoute le dossier assets au cas où
-          if (Test-Path "assets") {
-            Copy-Item -Path "assets" -Destination "WestPlay_Modifie_Final/assets" -Recurse -Force
-          }
+          $script = @"
+          [Setup]
+          AppName=WestPlay
+          AppVersion=2.1.4
+          DefaultDirName={autopf}\WestPlay
+          DefaultGroupName=WestPlay
+          OutputDir=.
+          OutputBaseFilename=WestPlay_10Band_Installer
+          Compression=lzma
+          SolidCompression=yes
+          WizardStyle=modern
+
+          [Files]
+          Source: "target\release\westplay.exe"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "app\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs
+          Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+          "@
+          Set-Content -Path "installer.iss" -Value $script
         shell: powershell
 
-      - name: Upload Working Game Package
+      - name: Compile Real Windows Installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        shell: powershell
+
+      - name: Upload Real Windows Installer
         uses: actions/upload-artifact@v4
         with:
-          name: WestPlay-Complet-Sans-Erreur
-          path: WestPlay_Modifie_Final/
+          name: WestPlay-Installeur-Final
+          path: WestPlay_10Band_Installer.exe
