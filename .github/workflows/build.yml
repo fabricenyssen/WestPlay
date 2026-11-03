@@ -1,4 +1,4 @@
-name: Build Fixed Package
+name: Build WestPlay Installer
 
 on:
   workflow_dispatch:
@@ -19,69 +19,56 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install Inno Setup
-        run: |
-          choco install innosetup -y
-        shell: powershell
-
       - name: Apply Patch
         run: |
+          # Applique le patch de l'égaliseur s'il est présent à la racine
           if (Test-Path "patch.diff") {
             git apply --verbose patch.diff
+          } elseif (Test-Path "westplay-2.1.4-son3d-egaliseur-reprise.patch") {
+            git apply --verbose westplay-2.1.4-son3d-egaliseur-reprise.patch
           }
         shell: powershell
 
-      - name: Bypass Plugin Check
+      - name: Compile Game Plugin (DLL)
         run: |
-          # Ce script cherche la vérification du plug-in dans le code Rust et la force à toujours répondre "vrai"
-          Get-ChildItem -Recurse -Filter "*.rs" | ForEach-Object {
-              $content = Get-Content $_.FullName -Raw
-              if ($content -match "is_plugin_installed" -or $content -match "check_plugin") {
-                  # On force les fonctions de vérification à renvoyer true pour éteindre le voyant rouge
-                  $content = $content -replace "fn is_plugin_installed\([^)]*\)\s*->\s*bool\s*\{[^}]*\}", "fn is_plugin_installed() -> bool { true }"
-                  Set-Content $_.FullName -Value $content -Force
-                  Write-Host "Vérification désactivée dans : $_.Name"
+          # Condition 1 : Compiler explicitement le plug-in sans target pour qu'il aille dans target/release/
+          cargo build --release -p westplay-plugin
+        shell: powershell
+
+      - name: Clean Author Signature from Config
+        run: |
+          # Condition 2 : Supprimer la clé de signature privée de l'auteur dans la config de release
+          $configPath = "app/tauri.release.conf.json"
+          if (Test-Path $configPath) {
+              $config = Get-Content $configPath -Raw | ConvertFrom-Json
+              # Supprime le bloc de signature pour éviter l'erreur de build Tauri
+              if ($config.bundle.windows -and $config.bundle.windows.certificateThumbprint) {
+                  $config.bundle.windows.PSObject.Properties.Remove("certificateThumbprint")
               }
+              $config | ConvertTo-Json -Depth 100 | Set-Content $configPath
+              Write-Host "Clé de signature retirée avec succès de tauri.release.conf.json"
+          } else {
+              Write-Host "Utilisation de app/tauri.conf.json (tauri.release.conf.json introuvable)"
           }
         shell: powershell
 
-      - name: Compile Application
+      - name: Build Official Installer
         run: |
           npm install
-          npx tauri build --config app/tauri.conf.json
+          # Utilise le fichier de configuration de release si disponible
+          if (Test-Path "app/tauri.release.conf.json") {
+            npx tauri build --config app/tauri.release.conf.json
+          } else {
+            npx tauri build --config app/tauri.conf.json
+          }
         env:
           CI: true
-        continue-on-error: true
 
-      - name: Create Inno Setup Script
-        run: |
-          $script = @"
-          [Setup]
-          AppName=WestPlay
-          AppVersion=2.1.4
-          DefaultDirName={autopf}\WestPlay
-          DefaultGroupName=WestPlay
-          OutputDir=.
-          OutputBaseFilename=WestPlay_10Band_Installer
-          Compression=lzma
-          SolidCompression=yes
-          WizardStyle=modern
-
-          [Files]
-          Source: "target\release\westplay.exe"; DestDir: "{app}"; Flags: ignoreversion
-          Source: "app\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs
-          Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
-          "@
-          Set-Content -Path "installer.iss" -Value $script
-        shell: powershell
-
-      - name: Compile Real Windows Installer
-        run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-        shell: powershell
-
-      - name: Upload Real Windows Installer
+      - name: Verify and Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: WestPlay-Installeur-Final
-          path: WestPlay_10Band_Installer.exe
+          name: WestPlay-Installeur-Officiel
+          path: |
+            **/target/release/bundle/nsis/*.exe
+            **/target/release/bundle/msi/*.msi
+          if-no-files-found: error
