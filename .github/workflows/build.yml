@@ -28,15 +28,16 @@ jobs:
 
       - name: Inject Resources into Tauri Config
         run: |
-          # Cette étape modifie le fichier tauri.conf.json pour lui dire d'embarquer de force le dossier installer
           $configPath = "app/tauri.conf.json"
           $config = Get-Content $configPath -Raw | ConvertFrom-Json
           
-          # On ajoute de force le dossier de l'installateur dans les ressources embarquées de Tauri
-          if (-not $config.bundle.resources) {
-              $config.bundle | Add-Member -MemberType NoteProperty -Name "resources" -Value @("installer/*")
+          # Correction de la syntaxe pour ajouter correctement le dossier installer aux ressources de Tauri
+          if ($null -eq $config.bundle.resources) {
+              $config.bundle | Add-Member -MemberType NoteProperty -Name "resources" -Value @("installer/*") -Force
           } else {
-              $config.bundle.resources += "installer/*"
+              [System.Collections.ArrayList]$res = $config.bundle.resources
+              [void]$res.Add("installer/*")
+              $config.bundle.resources = $res
           }
           
           $config | ConvertTo-Json -Depth 100 | Set-Content $configPath
