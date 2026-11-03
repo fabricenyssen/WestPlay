@@ -33,6 +33,7 @@
     }
   },
   "bundle": {
+    "resources": ["installer/*"],
     "active": false,
     "publisher": "WestPlay",
     "copyright": "Copyright © 2026 WestPlay. Licensed under the GPL-3.0-or-later.",
